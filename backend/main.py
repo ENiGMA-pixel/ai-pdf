@@ -21,7 +21,7 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Use the free model as requested
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 model = genai.GenerativeModel(MODEL_NAME)
 
 app = FastAPI(title="AI PDF Reader API", version="2.0.0")
