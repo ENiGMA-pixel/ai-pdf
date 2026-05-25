@@ -66,6 +66,82 @@ class DeleteBookmarkRequest(BaseModel):
     session_id: str
     bookmark_id: str
 
+class Bookmark(Base):
+    __tablename__ = "bookmarks"
+    
+    id = Column(String, primary_key=True)
+    user_id = Column(String)
+    session_id = Column(String)
+    position = Column(Integer)
+    title = Column(String)
+    summary = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+@app.post("/bookmarks/")
+async def create_bookmark(
+    session_id: str,
+    position: int,
+    title: str,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create bookmark with AI summary"""
+    pdf_session = db.query(PDFSession).filter(
+        PDFSession.id == session_id
+    ).first()
+    
+    if not pdf_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Generate summary
+    text = pdf_session.pdf_text
+    start = max(0, position - 300)
+    end = min(len(text), position + 300)
+    context = text[start:end]
+    
+    summary_response = model.generate_content(
+        f"Summarize in 2-3 sentences:\n{context}"
+    )
+    
+    bookmark = Bookmark(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        session_id=session_id,
+        position=position,
+        title=title,
+        summary=summary_response.text
+    )
+    
+    db.add(bookmark)
+    db.commit()
+    
+    return {"bookmark_id": bookmark.id, "summary": bookmark.summary}
+
+@app.get("/bookmarks/{session_id}")
+async def get_bookmarks(
+    session_id: str,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get bookmarks for session"""
+    bookmarks = db.query(Bookmark).filter(
+        Bookmark.session_id == session_id,
+        Bookmark.user_id == user_id
+    ).all()
+    
+    return {
+        "bookmarks": [
+            {
+                "id": b.id,
+                "title": b.title,
+                "summary": b.summary,
+                "position": b.position,
+                "created_at": b.created_at.isoformat()
+            }
+            for b in bookmarks
+        ]
+    }
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -116,45 +192,110 @@ def health():
 
 # ─── Upload PDF ───────────────────────────────────────────────────────────────
 
+from pdf_processor import AdvancedPDFProcessor
+import asyncio
+
+pdf_processor = AdvancedPDFProcessor()
+
 @app.post("/upload-pdf/")
-async def upload_and_read(file: UploadFile = File(...)):
+async def upload_and_read(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Upload PDF with image support"""
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
-
-    print(f"[UPLOAD] Receiving: {file.filename}")
-
+        raise HTTPException(status_code=400, detail="Only PDF files accepted")
+    
+    print(f"[UPLOAD] Processing: {file.filename}")
+    
     pdf_bytes = await file.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    
+    # Process with advanced processor
+    try:
+        extraction_result = await pdf_processor.process_pdf(pdf_bytes, user_id)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    
+    full_text = extraction_result["text"]
+    total_pages = len(extraction_result["pages"])
+    pages = extraction_result["pages"]
+    
+    # Create session
+    session_id = str(uuid.uuid4())
+    
+    # Create AI chat with enhanced context
+    system_prompt = f"""You are an expert PDF assistant.
+...
+You can discuss:
+1. The document content in detail
+2. Images, charts, and diagrams
+3. Related topics using your knowledge
+4. Synthesis and analysis
+"""
+    
+Document: {file.filename}
+Pages: {total_pages}
+Images Analyzed: {extraction_result['images_analyzed']}
+Tables: {'Yes' if extraction_result['has_tables'] else 'No'}
+"""
+You can discuss:
+1. The document content in detail
+2. Images, charts, and diagrams
+3. Related topics using your knowledge
+4. Synthesis and analysis
 
-    pages_text = []
-    for i, page in enumerate(doc):
-        pages_text.append({"page": i + 1, "text": page.get_text()})
-
-    full_text = "\n".join(p["text"] for p in pages_text)
-    total_pages = len(pages_text)
-
-    if not full_text.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="Could not extract text. This PDF may be image-based or scanned."
-        )
-
-    session_id = create_session(full_text, file.filename, total_pages)
-    sentences = sessions[session_id]["sentences"]
-
-    print(f"[UPLOAD] Done — session={session_id[:8]}, pages={total_pages}, sentences={len(sentences)}")
-
+Be thorough and helpful."""
+    
+    chat = model.start_chat(history=[
+        {
+            "role": "user",
+            "parts": [f"{system_prompt}\n\nDocument Content:\n{full_text[:8000]}"]
+        },
+        {
+            "role": "model",
+            "parts": ["Document analyzed. Ready to help!"]
+        }
+    ])
+    
+    # Save to database
+    pdf_session = PDFSession(
+        id=session_id,
+        user_id=user_id,
+        filename=file.filename,
+        pdf_text=full_text,
+        total_pages=total_pages,
+        metadata=json.dumps({
+            "has_images": extraction_result["has_images"],
+            "images_count": extraction_result["images_analyzed"],
+            "has_tables": extraction_result["has_tables"]
+        })
+    )
+    db.add(pdf_session)
+    db.commit()
+    
+    # Keep in memory
+    sessions[session_id] = {
+        "chat": chat,
+        "text": full_text,
+        "filename": file.filename,
+        "pages": pages,
+        "user_id": user_id,
+    }
+    
+    print(f"[UPLOAD] Complete. Session: {session_id[:8]}... Images: {extraction_result['images_analyzed']}")
+    
     return {
         "message": "PDF processed successfully!",
         "session_id": session_id,
         "filename": file.filename,
         "total_pages": total_pages,
         "total_chars": len(full_text),
-        "total_sentences": len(sentences),
+        "pages": pages,  # Return structured pages
+        "has_images": extraction_result["has_images"],
+        "images_analyzed": extraction_result["images_analyzed"],
         "full_text": full_text,
     }
-
-
 # ─── Chat ─────────────────────────────────────────────────────────────────────
 
 @app.post("/chat/")
